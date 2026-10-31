@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pastebin-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "PASTES",
+      "id": "ba8864786c404942ba2a268ec0315400"
+    }
+  ]
+}
