@@ -10,10 +10,7 @@
     "types": "wrangler types",
     "check": "tsc --noEmit"
   },
-  "dependencies": {
-    "@modelcontextprotocol/server": "^2.4.0",
-    "zod": "^4.1.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261023.1",
     "typescript": "^5.9.0",

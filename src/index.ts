@@ -1,5 +1,3 @@
-import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
-import { z } from "zod";
 import {
   ensureKeyRegistered,
   extractApiKey,
@@ -8,6 +6,12 @@ import {
   isValidKeyFormat,
   type AgentIdentity,
 } from "./auth";
+import {
+  handleMcpRpc,
+  parseJsonRpcMessages,
+  type McpToolDef,
+  type McpToolHandler,
+} from "./mcp-rpc";
 import {
   createPaste,
   deletePaste,
@@ -19,13 +23,6 @@ import {
 export interface Env {
   PASTES: KVNamespace;
 }
-
-type AuthProps = {
-  identity: AgentIdentity;
-};
-
-/** AsyncLocal-style bag so tools can read the current request's identity + env. */
-let current: { env: Env; identity: AgentIdentity } | null = null;
 
 function json(data: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -52,7 +49,7 @@ function unauthorized(message = "Missing or invalid API key"): Response {
 async function authenticate(
   request: Request,
   env: Env,
-): Promise<AuthProps | Response> {
+): Promise<AgentIdentity | Response> {
   const key = extractApiKey(request);
   if (!key) {
     return unauthorized(
@@ -64,172 +61,204 @@ async function authenticate(
       "API key must be at least 24 printable ASCII characters",
     );
   }
-
   const identity = await identityFromKey(key);
   await ensureKeyRegistered(env.PASTES, identity);
-  return { identity };
+  return identity;
 }
 
-function requireCtx() {
-  if (!current) {
-    throw new Error(
-      "Unauthenticated — set Authorization: Bearer <api_key> on the MCP connection",
-    );
+function asString(v: unknown, field: string, opts?: { max?: number; required?: boolean }): string | undefined {
+  if (v === undefined || v === null) {
+    if (opts?.required) throw new Error(`Missing required field: ${field}`);
+    return undefined;
   }
-  return current;
+  if (typeof v !== "string") throw new Error(`${field} must be a string`);
+  if (opts?.max && v.length > opts.max) throw new Error(`${field} too long`);
+  return v;
 }
 
-function createPastebinServer() {
-  const server = new McpServer({
-    name: "pastebin-mcp",
-    version: "1.0.0",
-  });
+function asNumber(v: unknown, field: string): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new Error(`${field} must be a number`);
+  }
+  return v;
+}
 
-  server.registerTool(
-    "create_paste",
-    {
-      description:
-        "Create a new paste owned by the calling agent's API key. Returns the paste id and metadata.",
-      inputSchema: {
-        content: z.string().min(1).max(500_000).describe("Paste body text"),
-        title: z.string().max(200).optional().describe("Optional title"),
-        language: z
-          .string()
-          .max(64)
-          .optional()
-          .describe("Optional language hint (e.g. typescript, markdown)"),
-      },
-    },
-    async ({ content, title, language }) => {
-      const { env, identity } = requireCtx();
-      const paste = await createPaste(env.PASTES, identity.keyHash, {
-        content,
-        title,
-        language,
-      });
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(publicPaste(paste), null, 2),
+function buildTools(
+  env: Env,
+  identity: AgentIdentity,
+): Record<string, { def: McpToolDef; handler: McpToolHandler }> {
+  const tool = (
+    def: McpToolDef,
+    handler: McpToolHandler,
+  ): { def: McpToolDef; handler: McpToolHandler } => ({ def, handler });
+
+  return {
+    create_paste: tool(
+      {
+        name: "create_paste",
+        description:
+          "Create a new paste owned by the calling agent's API key. Returns the paste id and metadata.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "Paste body text" },
+            title: { type: "string", description: "Optional title" },
+            language: {
+              type: "string",
+              description: "Optional language hint (e.g. typescript, markdown)",
+            },
           },
-        ],
-      };
-    },
-  );
-
-  server.registerTool(
-    "get_paste",
-    {
-      description:
-        "Fetch a paste by id. Only pastes owned by this API key are visible.",
-      inputSchema: {
-        id: z.string().min(1).max(64).describe("Paste id"),
+          required: ["content"],
+          additionalProperties: false,
+        },
       },
-    },
-    async ({ id }) => {
-      const { env, identity } = requireCtx();
-      const paste = await getPaste(env.PASTES, identity.keyHash, id);
-      if (!paste) {
+      async (args) => {
+        const content = asString(args.content, "content", {
+          required: true,
+          max: 500_000,
+        })!;
+        if (!content.length) throw new Error("content must not be empty");
+        const title = asString(args.title, "title", { max: 200 });
+        const language = asString(args.language, "language", { max: 64 });
+        const paste = await createPaste(env.PASTES, identity.keyHash, {
+          content,
+          title,
+          language,
+        });
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(publicPaste(paste), null, 2) },
+          ],
+        };
+      },
+    ),
+
+    get_paste: tool(
+      {
+        name: "get_paste",
+        description:
+          "Fetch a paste by id. Only pastes owned by this API key are visible.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Paste id" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+      async (args) => {
+        const id = asString(args.id, "id", { required: true, max: 64 })!;
+        const paste = await getPaste(env.PASTES, identity.keyHash, id);
+        if (!paste) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ error: "not_found", id }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(publicPaste(paste), null, 2) },
+          ],
+        };
+      },
+    ),
+
+    list_pastes: tool(
+      {
+        name: "list_pastes",
+        description:
+          "List pastes owned by this API key (newest first). Returns summaries without full content.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "integer",
+              description: "Max items (default 50, max 100)",
+              minimum: 1,
+              maximum: 100,
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+      async (args) => {
+        const limit = asNumber(args.limit, "limit") ?? 50;
+        const items = await listPastes(env.PASTES, identity.keyHash, limit);
         return {
           content: [
             {
-              type: "text" as const,
-              text: JSON.stringify({ error: "not_found", id }, null, 2),
+              type: "text",
+              text: JSON.stringify(
+                {
+                  fingerprint: identity.fingerprint,
+                  count: items.length,
+                  pastes: items,
+                },
+                null,
+                2,
+              ),
             },
           ],
-          isError: true,
         };
-      }
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(publicPaste(paste), null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  server.registerTool(
-    "list_pastes",
-    {
-      description:
-        "List pastes owned by this API key (newest first). Returns summaries without full content.",
-      inputSchema: {
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(100)
-          .optional()
-          .describe("Max items (default 50)"),
       },
-    },
-    async ({ limit }) => {
-      const { env, identity } = requireCtx();
-      const items = await listPastes(env.PASTES, identity.keyHash, limit ?? 50);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                fingerprint: identity.fingerprint,
-                count: items.length,
-                pastes: items,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    },
-  );
+    ),
 
-  server.registerTool(
-    "delete_paste",
-    {
-      description: "Delete a paste owned by this API key.",
-      inputSchema: {
-        id: z.string().min(1).max(64).describe("Paste id"),
+    delete_paste: tool(
+      {
+        name: "delete_paste",
+        description: "Delete a paste owned by this API key.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Paste id" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
       },
-    },
-    async ({ id }) => {
-      const { env, identity } = requireCtx();
-      const deleted = await deletePaste(env.PASTES, identity.keyHash, id);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              deleted
-                ? { ok: true, id }
-                : { ok: false, error: "not_found", id },
-              null,
-              2,
-            ),
-          },
-        ],
-        isError: !deleted,
-      };
-    },
-  );
+      async (args) => {
+        const id = asString(args.id, "id", { required: true, max: 64 })!;
+        const deleted = await deletePaste(env.PASTES, identity.keyHash, id);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                deleted
+                  ? { ok: true, id }
+                  : { ok: false, error: "not_found", id },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: !deleted,
+        };
+      },
+    ),
 
-  server.registerTool(
-    "whoami",
-    {
-      description:
-        "Show the authenticated API key fingerprint (not the secret) for this MCP session.",
-    },
-    async () => {
-      const { identity } = requireCtx();
-      return {
+    whoami: tool(
+      {
+        name: "whoami",
+        description:
+          "Show the authenticated API key fingerprint (not the secret) for this MCP session.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+      async () => ({
         content: [
           {
-            type: "text" as const,
+            type: "text",
             text: JSON.stringify(
               {
                 fingerprint: identity.fingerprint,
@@ -240,20 +269,83 @@ function createPastebinServer() {
             ),
           },
         ],
-      };
-    },
-  );
-
-  return server;
+      }),
+    ),
+  };
 }
 
-const mcpHandler = createMcpHandler(createPastebinServer);
+async function handleMcp(
+  request: Request,
+  env: Env,
+  identity: AgentIdentity,
+): Promise<Response> {
+  if (request.method === "GET" || request.method === "DELETE") {
+    return new Response("Method not allowed (stateless MCP)", {
+      status: 405,
+      headers: { Allow: "POST, OPTIONS" },
+    });
+  }
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers":
+          "content-type, authorization, x-api-key, mcp-protocol-version, accept",
+        "Access-Control-Max-Age": "86400",
+      },
+    });
+  }
+
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const tools = buildTools(env, identity);
+  const serverInfo = { name: "pastebin-mcp", version: "1.0.0" };
+  const messages = parseJsonRpcMessages(body);
+  const responses = [];
+
+  for (const msg of messages) {
+    if (!msg || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+      responses.push({
+        jsonrpc: "2.0",
+        id: (msg as { id?: string | number | null })?.id ?? null,
+        error: { code: -32600, message: "Invalid Request" },
+      });
+      continue;
+    }
+    const response = await handleMcpRpc(msg, tools, serverInfo);
+    if (response) responses.push(response);
+  }
+
+  // Notifications-only → 202 Accepted with empty body (MCP Streamable HTTP)
+  if (responses.length === 0) {
+    return new Response(null, { status: 202 });
+  }
+
+  const payload = Array.isArray(body) ? responses : responses[0];
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
 
 async function handleCreateKey(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") {
-    return json({ error: "method_not_allowed" }, 405, {
-      Allow: "POST",
-    });
+    return json({ error: "method_not_allowed" }, 405, { Allow: "POST" });
   }
 
   let label: string | undefined;
@@ -265,7 +357,7 @@ async function handleCreateKey(request: Request, env: Env): Promise<Response> {
         label = body.label.trim().slice(0, 80);
       }
     } catch {
-      // empty body is fine
+      // empty body ok
     }
   }
 
@@ -291,11 +383,10 @@ async function handleCreateKey(request: Request, env: Env): Promise<Response> {
 }
 
 function handleRoot(request: Request): Response {
-  const mcpUrl = new URL("/mcp", request.url).toString();
   return json({
     name: "pastebin-mcp",
     version: "1.0.0",
-    mcp: mcpUrl,
+    mcp: new URL("/mcp", request.url).toString(),
     auth: {
       type: "bearer",
       headers: ["Authorization: Bearer <api_key>", "X-API-Key: <api_key>"],
@@ -313,11 +404,7 @@ function handleRoot(request: Request): Response {
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    _ctx: ExecutionContext,
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/" || url.pathname === "") {
@@ -331,19 +418,7 @@ export default {
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
       const auth = await authenticate(request, env);
       if (auth instanceof Response) return auth;
-
-      current = { env, identity: auth.identity };
-      try {
-        return await mcpHandler.fetch(request, {
-          authInfo: {
-            token: "redacted",
-            clientId: auth.identity.fingerprint,
-            scopes: ["pastebin"],
-          },
-        });
-      } finally {
-        current = null;
-      }
+      return handleMcp(request, env, auth);
     }
 
     return json({ error: "not_found", path: url.pathname }, 404);
