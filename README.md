@@ -1,8 +1,8 @@
 # pastebin-mcp
 
-Pastebin MCP server on **Cloudflare Workers** (Streamable HTTP via `createMcpHandler`).
+Pastebin MCP server on **Cloudflare Workers** (stateless Streamable HTTP).
 
-Each calling agent supplies its **own API key** (`Authorization: Bearer …`). There is no shared Worker secret for client auth. Pastes are scoped to the key that created them.
+Each calling agent supplies its **own API key** (`Authorization: Bearer …`). There is no shared Worker secret for client auth. Pastes are scoped to the key that created them. The server does **not** implement OAuth (discovery paths return 404) so Cursor uses your configured headers.
 
 ## MCP endpoint
 
@@ -24,6 +24,8 @@ You can also generate any ≥24-character secret yourself and send it as the Bea
 
 ## Add in Cursor / agents
 
+Mint a key first, put it in your environment (do **not** commit the key), then add:
+
 **Cursor MCP** (`~/.cursor/mcp.json` or project `.cursor/mcp.json`):
 
 ```json
@@ -32,19 +34,21 @@ You can also generate any ≥24-character secret yourself and send it as the Bea
     "pastebin": {
       "url": "https://pastebin-mcp.zyxma-6666.workers.dev/mcp",
       "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
+        "Authorization": "Bearer ${env:PASTEBIN_API_KEY}"
       }
     }
   }
 }
 ```
 
+Set `PASTEBIN_API_KEY` in your shell/profile (or Cursor env), then reload MCP. Prefer `${env:…}` over pasting a raw key into `mcp.json`.
+
 **Claude Code:**
 
 ```bash
 claude mcp add --transport http pastebin \
   https://pastebin-mcp.zyxma-6666.workers.dev/mcp \
-  --header "Authorization: Bearer YOUR_API_KEY"
+  --header "Authorization: Bearer ${PASTEBIN_API_KEY}"
 ```
 
 **Agents SDK** (`addMcpServer`):
@@ -61,7 +65,7 @@ await agent.addMcpServer(
 );
 ```
 
-Alternate header: `X-API-Key: YOUR_API_KEY`.
+Alternate header: `X-API-Key` with the same key value.
 
 ## Tools
 

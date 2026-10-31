@@ -55,7 +55,19 @@ async function ensureKeyRegistered(kv, identity, label) {
 __name(ensureKeyRegistered, "ensureKeyRegistered");
 
 // src/mcp-rpc.ts
-var PROTOCOL_VERSION = "2025-03-26";
+var SUPPORTED_PROTOCOL_VERSIONS = [
+  "2025-06-18",
+  "2025-03-26"
+];
+function negotiateProtocolVersion(requested) {
+  if (typeof requested === "string") {
+    if (SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) {
+      return requested;
+    }
+  }
+  return SUPPORTED_PROTOCOL_VERSIONS[0];
+}
+__name(negotiateProtocolVersion, "negotiateProtocolVersion");
 function parseJsonRpcMessages(body) {
   if (Array.isArray(body)) return body;
   if (body && typeof body === "object") return [body];
@@ -83,12 +95,15 @@ async function handleMcpRpc(message, tools, serverInfo) {
   if (isNotification) return null;
   const reqId = id ?? null;
   switch (method) {
-    case "initialize":
+    case "initialize": {
+      const params = message.params ?? {};
+      const protocolVersion = negotiateProtocolVersion(params.protocolVersion);
       return jsonRpcResult(reqId, {
-        protocolVersion: PROTOCOL_VERSION,
+        protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo
       });
+    }
     case "ping":
       return jsonRpcResult(reqId, {});
     case "tools/list":
@@ -99,7 +114,11 @@ async function handleMcpRpc(message, tools, serverInfo) {
       const params = message.params ?? {};
       const name = params.name;
       if (!name || !tools[name]) {
-        return jsonRpcError(reqId, -32601, `Unknown tool: ${name ?? "(missing)"}`);
+        return jsonRpcError(
+          reqId,
+          -32601,
+          `Unknown tool: ${name ?? "(missing)"}`
+        );
       }
       try {
         const result = await tools[name].handler(params.arguments ?? {});
@@ -117,6 +136,53 @@ async function handleMcpRpc(message, tools, serverInfo) {
   }
 }
 __name(handleMcpRpc, "handleMcpRpc");
+function wantsSseResponse(request) {
+  const accept = (request.headers.get("accept") ?? "").toLowerCase();
+  if (!accept) return false;
+  const wantsJson = accept.includes("application/json");
+  const wantsSse = accept.includes("text/event-stream");
+  return wantsSse && !wantsJson;
+}
+__name(wantsSseResponse, "wantsSseResponse");
+function mcpJsonResponse(payload, request, status = 200) {
+  const cors = corsHeaders(request);
+  if (wantsSseResponse(request)) {
+    const data = `event: message
+data: ${JSON.stringify(payload)}
+
+`;
+    return new Response(data, {
+      status,
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        ...cors
+      }
+    });
+  }
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      ...cors
+    }
+  });
+}
+__name(mcpJsonResponse, "mcpJsonResponse");
+function corsHeaders(request) {
+  const origin = request.headers.get("Origin");
+  return {
+    // Echo concrete Origin when present (credentials-friendly); else *
+    "Access-Control-Allow-Origin": origin && origin !== "null" ? origin : "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, X-API-Key, Mcp-Protocol-Version, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin"
+  };
+}
+__name(corsHeaders, "corsHeaders");
 
 // src/pastes.ts
 var PASTE_ID_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -220,7 +286,7 @@ function json(data, status = 200, headers = {}) {
   });
 }
 __name(json, "json");
-function unauthorized(message = "Missing or invalid API key") {
+function unauthorized(request, message = "Missing or invalid API key") {
   return json(
     {
       error: "unauthorized",
@@ -228,7 +294,7 @@ function unauthorized(message = "Missing or invalid API key") {
       hint: "Pass Authorization: Bearer <api_key> (or X-API-Key). Mint a key with POST /v1/keys."
     },
     401,
-    { "WWW-Authenticate": 'Bearer realm="pastebin-mcp"' }
+    corsHeaders(request)
   );
 }
 __name(unauthorized, "unauthorized");
@@ -236,11 +302,13 @@ async function authenticate(request, env) {
   const key = extractApiKey(request);
   if (!key) {
     return unauthorized(
+      request,
       "Provide Authorization: Bearer <api_key> or X-API-Key header"
     );
   }
   if (!isValidKeyFormat(key)) {
     return unauthorized(
+      request,
       "API key must be at least 24 printable ASCII characters"
     );
   }
@@ -440,35 +508,37 @@ function buildTools(env, identity) {
   };
 }
 __name(buildTools, "buildTools");
+function handleCorsPreflight(request) {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(request)
+  });
+}
+__name(handleCorsPreflight, "handleCorsPreflight");
 async function handleMcp(request, env, identity) {
   if (request.method === "GET" || request.method === "DELETE") {
     return new Response("Method not allowed (stateless MCP)", {
       status: 405,
-      headers: { Allow: "POST, OPTIONS" }
-    });
-  }
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
       headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "content-type, authorization, x-api-key, mcp-protocol-version, accept",
-        "Access-Control-Max-Age": "86400"
+        Allow: "POST, OPTIONS",
+        ...corsHeaders(request)
       }
     });
   }
   if (request.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { Allow: "POST, OPTIONS", ...corsHeaders(request) }
+    });
   }
   let body;
   try {
     body = await request.json();
   } catch {
-    return json({ error: "invalid_json" }, 400);
+    return json({ error: "invalid_json" }, 400, corsHeaders(request));
   }
   const tools = buildTools(env, identity);
-  const serverInfo = { name: "pastebin-mcp", version: "1.0.0" };
+  const serverInfo = { name: "pastebin-mcp", version: "1.0.1" };
   const messages = parseJsonRpcMessages(body);
   const responses = [];
   for (const msg of messages) {
@@ -484,21 +554,22 @@ async function handleMcp(request, env, identity) {
     if (response) responses.push(response);
   }
   if (responses.length === 0) {
-    return new Response(null, { status: 202 });
+    return new Response(null, {
+      status: 202,
+      headers: corsHeaders(request)
+    });
   }
   const payload = Array.isArray(body) ? responses : responses[0];
-  return new Response(JSON.stringify(payload), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    }
-  });
+  return mcpJsonResponse(payload, request, 200);
 }
 __name(handleMcp, "handleMcp");
 async function handleCreateKey(request, env) {
+  if (request.method === "OPTIONS") return handleCorsPreflight(request);
   if (request.method !== "POST") {
-    return json({ error: "method_not_allowed" }, 405, { Allow: "POST" });
+    return json({ error: "method_not_allowed" }, 405, {
+      Allow: "POST",
+      ...corsHeaders(request)
+    });
   }
   let label;
   const contentType = request.headers.get("content-type") ?? "";
@@ -526,46 +597,71 @@ async function handleCreateKey(request, env) {
       },
       warning: "Store this API key now \u2014 it is shown only once. The server stores only a hash."
     },
-    201
+    201,
+    corsHeaders(request)
   );
 }
 __name(handleCreateKey, "handleCreateKey");
 function handleRoot(request) {
-  return json({
-    name: "pastebin-mcp",
-    version: "1.0.0",
-    mcp: new URL("/mcp", request.url).toString(),
-    auth: {
-      type: "bearer",
-      headers: ["Authorization: Bearer <api_key>", "X-API-Key: <api_key>"],
-      mint_key: "POST /v1/keys",
-      note: "Each agent supplies its own API key. No shared Worker secret for client auth."
+  return json(
+    {
+      name: "pastebin-mcp",
+      version: "1.0.1",
+      mcp: new URL("/mcp", request.url).toString(),
+      auth: {
+        type: "bearer",
+        headers: ["Authorization: Bearer <api_key>", "X-API-Key: <api_key>"],
+        mint_key: "POST /v1/keys",
+        note: "Each agent supplies its own API key. No shared Worker secret for client auth. No OAuth."
+      },
+      tools: [
+        "create_paste",
+        "get_paste",
+        "list_pastes",
+        "delete_paste",
+        "whoami"
+      ]
     },
-    tools: [
-      "create_paste",
-      "get_paste",
-      "list_pastes",
-      "delete_paste",
-      "whoami"
-    ]
-  });
+    200,
+    corsHeaders(request)
+  );
 }
 __name(handleRoot, "handleRoot");
+function isOauthDiscoveryPath(pathname) {
+  return pathname.startsWith("/.well-known/") || pathname === "/register" || pathname.endsWith("/.well-known/openid-configuration") || pathname.includes("/.well-known/");
+}
+__name(isOauthDiscoveryPath, "isOauthDiscoveryPath");
 var index_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/" || url.pathname === "") {
+    const { pathname } = url;
+    if (isOauthDiscoveryPath(pathname)) {
+      return json(
+        { error: "not_found", path: pathname },
+        404,
+        corsHeaders(request)
+      );
+    }
+    if (pathname === "/" || pathname === "") {
+      if (request.method === "OPTIONS") return handleCorsPreflight(request);
       return handleRoot(request);
     }
-    if (url.pathname === "/v1/keys") {
+    if (pathname === "/v1/keys") {
       return handleCreateKey(request, env);
     }
-    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+    if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
+      if (request.method === "OPTIONS") {
+        return handleCorsPreflight(request);
+      }
       const auth = await authenticate(request, env);
       if (auth instanceof Response) return auth;
       return handleMcp(request, env, auth);
     }
-    return json({ error: "not_found", path: url.pathname }, 404);
+    return json(
+      { error: "not_found", path: pathname },
+      404,
+      corsHeaders(request)
+    );
   }
 };
 export {
