@@ -181,7 +181,7 @@ export function corsHeaders(request: Request): Record<string, string> {
     "Access-Control-Allow-Origin": origin && origin !== "null" ? origin : "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
     "Access-Control-Allow-Headers":
-      "Authorization, Content-Type, Accept, X-API-Key, Mcp-Protocol-Version, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID",
+      "Authorization, Content-Type, Accept, X-API-Key, X-Pastebin-User-Key, X-API-User-Key, Mcp-Protocol-Version, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID",
     "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",

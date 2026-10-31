@@ -1,11 +1,4 @@
-import {
-  ensureKeyRegistered,
-  extractApiKey,
-  generateApiKey,
-  identityFromKey,
-  isValidKeyFormat,
-  type AgentIdentity,
-} from "./auth";
+import { credsFromRequest, type PastebinCreds } from "./auth";
 import {
   corsHeaders,
   handleMcpRpc,
@@ -19,11 +12,11 @@ import {
   deletePaste,
   getPaste,
   listPastes,
-  publicPaste,
-} from "./pastes";
+  loginUser,
+} from "./pastebin-api";
 
 export interface Env {
-  PASTES: KVNamespace;
+  // No shared Pastebin secret — agents supply api_dev_key on each request.
 }
 
 function json(data: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -36,45 +29,28 @@ function json(data: unknown, status = 200, headers: HeadersInit = {}): Response 
   });
 }
 
-/**
- * Bare 401 — no WWW-Authenticate / resource_metadata.
- * Cursor otherwise probes OAuth discovery and can ignore configured headers.
- */
-function unauthorized(
-  request: Request,
-  message = "Missing or invalid API key",
-): Response {
+/** Bare 401 — no WWW-Authenticate (avoids Cursor OAuth probing). */
+function unauthorized(request: Request, message: string): Response {
   return json(
     {
       error: "unauthorized",
       message,
-      hint: "Pass Authorization: Bearer <api_key> (or X-API-Key). Mint a key with POST /v1/keys.",
+      hint: "Pass Authorization: Bearer <pastebin_api_dev_key> (or X-API-Key). Get a key at https://pastebin.com/doc_api after signing in. Optional: X-Pastebin-User-Key for member list/delete/private.",
     },
     401,
     corsHeaders(request),
   );
 }
 
-async function authenticate(
-  request: Request,
-  env: Env,
-): Promise<AgentIdentity | Response> {
-  const key = extractApiKey(request);
-  if (!key) {
+function authenticate(request: Request): PastebinCreds | Response {
+  const creds = credsFromRequest(request);
+  if (!creds) {
     return unauthorized(
       request,
-      "Provide Authorization: Bearer <api_key> or X-API-Key header",
+      "Provide your Pastebin Developer API Key via Authorization: Bearer … or X-API-Key",
     );
   }
-  if (!isValidKeyFormat(key)) {
-    return unauthorized(
-      request,
-      "API key must be at least 24 printable ASCII characters",
-    );
-  }
-  const identity = await identityFromKey(key);
-  await ensureKeyRegistered(env.PASTES, identity);
-  return identity;
+  return creds;
 }
 
 function asString(
@@ -100,8 +76,7 @@ function asNumber(v: unknown, field: string): number | undefined {
 }
 
 function buildTools(
-  env: Env,
-  identity: AgentIdentity,
+  creds: PastebinCreds,
 ): Record<string, { def: McpToolDef; handler: McpToolHandler }> {
   const tool = (
     def: McpToolDef,
@@ -113,15 +88,25 @@ function buildTools(
       {
         name: "create_paste",
         description:
-          "Create a new paste owned by the calling agent's API key. Returns the paste id and metadata.",
+          "Create a paste on pastebin.com using the caller's api_dev_key. Returns the pastebin.com URL and id.",
         inputSchema: {
           type: "object",
           properties: {
             content: { type: "string", description: "Paste body text" },
-            title: { type: "string", description: "Optional title" },
+            title: { type: "string", description: "Optional title / filename" },
             language: {
               type: "string",
-              description: "Optional language hint (e.g. typescript, markdown)",
+              description:
+                "Optional Pastebin format key (e.g. javascript, python, text)",
+            },
+            visibility: {
+              type: "integer",
+              description: "0=public, 1=unlisted (default), 2=private (needs user key)",
+              enum: [0, 1, 2],
+            },
+            expire: {
+              type: "string",
+              description: "Optional expiry: N, 10M, 1H, 1D, 1W, 2W, 1M, 6M, 1Y",
             },
           },
           required: ["content"],
@@ -131,19 +116,33 @@ function buildTools(
       async (args) => {
         const content = asString(args.content, "content", {
           required: true,
-          max: 500_000,
+          max: 512_000,
         })!;
         if (!content.length) throw new Error("content must not be empty");
-        const title = asString(args.title, "title", { max: 200 });
+        const title = asString(args.title, "title", { max: 100 });
         const language = asString(args.language, "language", { max: 64 });
-        const paste = await createPaste(env.PASTES, identity.keyHash, {
+        const expire = asString(args.expire, "expire", { max: 8 });
+        const visNum = asNumber(args.visibility, "visibility");
+        const visibility =
+          visNum === 0 || visNum === 1 || visNum === 2 ? visNum : undefined;
+
+        const paste = await createPaste(creds, {
           content,
           title,
           language,
+          expire,
+          visibility,
         });
         return {
           content: [
-            { type: "text", text: JSON.stringify(publicPaste(paste), null, 2) },
+            {
+              type: "text",
+              text: JSON.stringify(
+                { id: paste.id, url: paste.url, site: "pastebin.com" },
+                null,
+                2,
+              ),
+            },
           ],
         };
       },
@@ -153,33 +152,28 @@ function buildTools(
       {
         name: "get_paste",
         description:
-          "Fetch a paste by id. Only pastes owned by this API key are visible.",
+          "Fetch a paste from pastebin.com by id or URL (uses /raw/ or authenticated api_raw for private).",
         inputSchema: {
           type: "object",
           properties: {
-            id: { type: "string", description: "Paste id" },
+            id: {
+              type: "string",
+              description: "Paste id or full pastebin.com URL",
+            },
           },
           required: ["id"],
           additionalProperties: false,
         },
       },
       async (args) => {
-        const id = asString(args.id, "id", { required: true, max: 64 })!;
-        const paste = await getPaste(env.PASTES, identity.keyHash, id);
-        if (!paste) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({ error: "not_found", id }, null, 2),
-              },
-            ],
-            isError: true,
-          };
-        }
+        const id = asString(args.id, "id", { required: true, max: 200 })!;
+        const paste = await getPaste(creds, id);
         return {
           content: [
-            { type: "text", text: JSON.stringify(publicPaste(paste), null, 2) },
+            {
+              type: "text",
+              text: JSON.stringify(paste, null, 2),
+            },
           ],
         };
       },
@@ -189,15 +183,15 @@ function buildTools(
       {
         name: "list_pastes",
         description:
-          "List pastes owned by this API key (newest first). Returns summaries without full content.",
+          "List pastes for the Pastebin member account. Requires X-Pastebin-User-Key header.",
         inputSchema: {
           type: "object",
           properties: {
             limit: {
               type: "integer",
-              description: "Max items (default 50, max 100)",
+              description: "Max items (default 50, max 1000)",
               minimum: 1,
-              maximum: 100,
+              maximum: 1000,
             },
           },
           additionalProperties: false,
@@ -205,16 +199,80 @@ function buildTools(
       },
       async (args) => {
         const limit = asNumber(args.limit, "limit") ?? 50;
-        const items = await listPastes(env.PASTES, identity.keyHash, limit);
+        const pastes = await listPastes(creds, limit);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ count: pastes.length, pastes }, null, 2),
+            },
+          ],
+        };
+      },
+    ),
+
+    delete_paste: tool(
+      {
+        name: "delete_paste",
+        description:
+          "Delete a paste owned by the member account. Requires X-Pastebin-User-Key.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Paste id or pastebin.com URL",
+            },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+      async (args) => {
+        const id = asString(args.id, "id", { required: true, max: 200 })!;
+        const result = await deletePaste(creds, id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      },
+    ),
+
+    login: tool(
+      {
+        name: "login",
+        description:
+          "Exchange Pastebin username/password for an api_user_key (session). Store it as X-Pastebin-User-Key on later requests. Do not log the password.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            username: { type: "string" },
+            password: { type: "string" },
+          },
+          required: ["username", "password"],
+          additionalProperties: false,
+        },
+      },
+      async (args) => {
+        const username = asString(args.username, "username", {
+          required: true,
+          max: 64,
+        })!;
+        const password = asString(args.password, "password", {
+          required: true,
+          max: 128,
+        })!;
+        const userKey = await loginUser(creds.devKey, username, password);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
-                  fingerprint: identity.fingerprint,
-                  count: items.length,
-                  pastes: items,
+                  api_user_key: userKey,
+                  usage:
+                    "Send header X-Pastebin-User-Key with this value for list/delete/private pastes.",
+                  warning:
+                    "Treat api_user_key like a password. Prefer setting it in MCP client headers, not chat logs.",
                 },
                 null,
                 2,
@@ -225,45 +283,11 @@ function buildTools(
       },
     ),
 
-    delete_paste: tool(
-      {
-        name: "delete_paste",
-        description: "Delete a paste owned by this API key.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            id: { type: "string", description: "Paste id" },
-          },
-          required: ["id"],
-          additionalProperties: false,
-        },
-      },
-      async (args) => {
-        const id = asString(args.id, "id", { required: true, max: 64 })!;
-        const deleted = await deletePaste(env.PASTES, identity.keyHash, id);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                deleted
-                  ? { ok: true, id }
-                  : { ok: false, error: "not_found", id },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: !deleted,
-        };
-      },
-    ),
-
     whoami: tool(
       {
         name: "whoami",
         description:
-          "Show the authenticated API key fingerprint (not the secret) for this MCP session.",
+          "Show whether a Pastebin user key is attached (never returns the secret keys).",
         inputSchema: {
           type: "object",
           properties: {},
@@ -276,8 +300,10 @@ function buildTools(
             type: "text",
             text: JSON.stringify(
               {
-                fingerprint: identity.fingerprint,
-                note: "Pastes are scoped to this API key. Other keys cannot read them.",
+                backend: "pastebin.com",
+                has_dev_key: true,
+                has_user_key: Boolean(creds.userKey),
+                note: "api_dev_key comes from Authorization / X-API-Key. Optional api_user_key from X-Pastebin-User-Key.",
               },
               null,
               2,
@@ -298,17 +324,12 @@ function handleCorsPreflight(request: Request): Response {
 
 async function handleMcp(
   request: Request,
-  env: Env,
-  identity: AgentIdentity,
+  creds: PastebinCreds,
 ): Promise<Response> {
-  // Stateless server: no long-lived SSE listen stream.
   if (request.method === "GET" || request.method === "DELETE") {
     return new Response("Method not allowed (stateless MCP)", {
       status: 405,
-      headers: {
-        Allow: "POST, OPTIONS",
-        ...corsHeaders(request),
-      },
+      headers: { Allow: "POST, OPTIONS", ...corsHeaders(request) },
     });
   }
 
@@ -326,8 +347,8 @@ async function handleMcp(
     return json({ error: "invalid_json" }, 400, corsHeaders(request));
   }
 
-  const tools = buildTools(env, identity);
-  const serverInfo = { name: "pastebin-mcp", version: "1.0.1" };
+  const tools = buildTools(creds);
+  const serverInfo = { name: "pastebin-mcp", version: "2.0.0" };
   const messages = parseJsonRpcMessages(body);
   const responses = [];
 
@@ -344,79 +365,37 @@ async function handleMcp(
     if (response) responses.push(response);
   }
 
-  // Notifications-only → 202 Accepted with empty body (MCP Streamable HTTP)
   if (responses.length === 0) {
-    return new Response(null, {
-      status: 202,
-      headers: corsHeaders(request),
-    });
+    return new Response(null, { status: 202, headers: corsHeaders(request) });
   }
 
   const payload = Array.isArray(body) ? responses : responses[0];
   return mcpJsonResponse(payload, request, 200);
 }
 
-async function handleCreateKey(request: Request, env: Env): Promise<Response> {
-  if (request.method === "OPTIONS") return handleCorsPreflight(request);
-  if (request.method !== "POST") {
-    return json({ error: "method_not_allowed" }, 405, {
-      Allow: "POST",
-      ...corsHeaders(request),
-    });
-  }
-
-  let label: string | undefined;
-  const contentType = request.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    try {
-      const body = (await request.json()) as { label?: unknown };
-      if (typeof body.label === "string" && body.label.trim()) {
-        label = body.label.trim().slice(0, 80);
-      }
-    } catch {
-      // empty body ok
-    }
-  }
-
-  const apiKey = generateApiKey();
-  const identity = await identityFromKey(apiKey);
-  const record = await ensureKeyRegistered(env.PASTES, identity, label);
-
-  return json(
-    {
-      api_key: apiKey,
-      fingerprint: record.fingerprint,
-      created_at: record.createdAt,
-      label: record.label ?? null,
-      usage: {
-        header: `Authorization: Bearer ${apiKey}`,
-        mcp_url: new URL("/mcp", request.url).toString(),
-      },
-      warning:
-        "Store this API key now — it is shown only once. The server stores only a hash.",
-    },
-    201,
-    corsHeaders(request),
-  );
-}
-
 function handleRoot(request: Request): Response {
   return json(
     {
       name: "pastebin-mcp",
-      version: "1.0.1",
+      version: "2.0.0",
+      backend: "https://pastebin.com",
       mcp: new URL("/mcp", request.url).toString(),
       auth: {
-        type: "bearer",
-        headers: ["Authorization: Bearer <api_key>", "X-API-Key: <api_key>"],
-        mint_key: "POST /v1/keys",
-        note: "Each agent supplies its own API key. No shared Worker secret for client auth. No OAuth.",
+        type: "pastebin_api_dev_key",
+        headers: [
+          "Authorization: Bearer <pastebin_api_dev_key>",
+          "X-API-Key: <pastebin_api_dev_key>",
+          "X-Pastebin-User-Key: <api_user_key> (optional)",
+        ],
+        get_dev_key: "https://pastebin.com/doc_api (sign in)",
+        note: "Each agent supplies its own Pastebin Developer API Key. Nothing is baked into the Worker.",
       },
       tools: [
         "create_paste",
         "get_paste",
         "list_pastes",
         "delete_paste",
+        "login",
         "whoami",
       ],
     },
@@ -429,17 +408,15 @@ function isOauthDiscoveryPath(pathname: string): boolean {
   return (
     pathname.startsWith("/.well-known/") ||
     pathname === "/register" ||
-    pathname.endsWith("/.well-known/openid-configuration") ||
     pathname.includes("/.well-known/")
   );
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, _env: Env): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
 
-    // Never advertise OAuth — Cursor would ignore static Authorization headers.
     if (isOauthDiscoveryPath(pathname)) {
       return json(
         { error: "not_found", path: pathname },
@@ -453,19 +430,11 @@ export default {
       return handleRoot(request);
     }
 
-    if (pathname === "/v1/keys") {
-      return handleCreateKey(request, env);
-    }
-
     if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
-      // CORS preflight must succeed without credentials (browsers omit Authorization).
-      if (request.method === "OPTIONS") {
-        return handleCorsPreflight(request);
-      }
-
-      const auth = await authenticate(request, env);
+      if (request.method === "OPTIONS") return handleCorsPreflight(request);
+      const auth = authenticate(request);
       if (auth instanceof Response) return auth;
-      return handleMcp(request, env, auth);
+      return handleMcp(request, auth);
     }
 
     return json(

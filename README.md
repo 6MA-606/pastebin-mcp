@@ -1,8 +1,8 @@
 # pastebin-mcp
 
-Pastebin MCP server on **Cloudflare Workers** (stateless Streamable HTTP).
+MCP server on **Cloudflare Workers** that talks to **[pastebin.com](https://pastebin.com)** (official Developers API).
 
-Each calling agent supplies its **own API key** (`Authorization: Bearer …`). There is no shared Worker secret for client auth. Pastes are scoped to the key that created them. The server does **not** implement OAuth (discovery paths return 404) so Cursor uses your configured headers.
+Each calling agent supplies its **own Pastebin Developer API Key** — nothing is baked into the Worker.
 
 ## MCP endpoint
 
@@ -10,23 +10,14 @@ Each calling agent supplies its **own API key** (`Authorization: Bearer …`). T
 https://pastebin-mcp.zyxma-6666.workers.dev/mcp
 ```
 
-## Mint an API key
+## Get a Pastebin API key
 
-```bash
-curl -sS -X POST https://pastebin-mcp.zyxma-6666.workers.dev/v1/keys \
-  -H 'content-type: application/json' \
-  -d '{"label":"cursor-agent"}'
-```
+1. Sign in at [pastebin.com](https://pastebin.com)
+2. Open [Developers API](https://pastebin.com/doc_api) — your **api_dev_key** is shown there
 
-Save `api_key` from the response — it is shown only once (the Worker stores a SHA-256 hash).
+Optional (list / delete / private pastes): obtain `api_user_key` via the MCP `login` tool or [api_login.php](https://pastebin.com/doc_api), then send it as `X-Pastebin-User-Key`.
 
-You can also generate any ≥24-character secret yourself and send it as the Bearer token; the first request registers its hash.
-
-## Add in Cursor / agents
-
-Mint a key first, put it in your environment (do **not** commit the key), then add:
-
-**Cursor MCP** (`~/.cursor/mcp.json` or project `.cursor/mcp.json`):
+## Add in Cursor
 
 ```json
 {
@@ -34,48 +25,29 @@ Mint a key first, put it in your environment (do **not** commit the key), then a
     "pastebin": {
       "url": "https://pastebin-mcp.zyxma-6666.workers.dev/mcp",
       "headers": {
-        "Authorization": "Bearer ${env:PASTEBIN_API_KEY}"
+        "Authorization": "Bearer ${env:PASTEBIN_API_DEV_KEY}"
       }
     }
   }
 }
 ```
 
-Set `PASTEBIN_API_KEY` in your shell/profile (or Cursor env), then reload MCP. Prefer `${env:…}` over pasting a raw key into `mcp.json`.
+Set `PASTEBIN_API_DEV_KEY` to your Pastebin developer key (do not commit the key). For member features also set:
 
-**Claude Code:**
-
-```bash
-claude mcp add --transport http pastebin \
-  https://pastebin-mcp.zyxma-6666.workers.dev/mcp \
-  --header "Authorization: Bearer ${PASTEBIN_API_KEY}"
+```json
+"X-Pastebin-User-Key": "${env:PASTEBIN_API_USER_KEY}"
 ```
-
-**Agents SDK** (`addMcpServer`):
-
-```ts
-await agent.addMcpServer(
-  "pastebin",
-  "https://pastebin-mcp.zyxma-6666.workers.dev/mcp",
-  {
-    transport: {
-      headers: { Authorization: `Bearer ${process.env.PASTEBIN_API_KEY}` },
-    },
-  },
-);
-```
-
-Alternate header: `X-API-Key` with the same key value.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `create_paste` | Create a paste (`content`, optional `title`, `language`) |
-| `get_paste` | Fetch by `id` (own key only) |
-| `list_pastes` | List summaries (newest first) |
-| `delete_paste` | Delete by `id` |
-| `whoami` | Show key fingerprint (not the secret) |
+| `create_paste` | Create on pastebin.com → returns URL |
+| `get_paste` | Fetch by id/URL |
+| `list_pastes` | Member pastes (needs user key) |
+| `delete_paste` | Delete member paste (needs user key) |
+| `login` | Username/password → `api_user_key` |
+| `whoami` | Shows whether user key is attached (never echoes secrets) |
 
 ## Local development
 
@@ -84,22 +56,13 @@ npm install
 npm run dev
 ```
 
-Then mint a key against `http://127.0.0.1:8787/v1/keys` and point your MCP client at `http://127.0.0.1:8787/mcp`.
-
 ## Deploy
 
 ```bash
-npm install
 npx wrangler deploy
 ```
 
-Requires Cloudflare auth (`wrangler login` or `CLOUDFLARE_API_TOKEN`). KV namespace binding `PASTES` is configured in `wrangler.jsonc`.
+## Secrets
 
-## Secrets Sittha must set
-
-None for client auth. Agents mint or choose their own keys.
-
-Optional ops only:
-
-- Cloudflare account access for future deploys (`wrangler login` / API token with Workers + KV edit)
-- Keep your personal pastebin API key private (treat like a password)
+- **Worker:** none required for Pastebin (agents pass their own `api_dev_key`)
+- **Client:** each agent’s Pastebin Developer API Key via Bearer / `X-API-Key`
